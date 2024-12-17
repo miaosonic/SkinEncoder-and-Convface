@@ -9,8 +9,7 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import to_2tuple
 import warnings
 
-# 忽略所有用户警告
-warnings.filterwarnings("ignore", category=UserWarning)
+
 
 class Downsampling(nn.Module):
     """
@@ -82,62 +81,6 @@ class StarReLU(nn.Module):
 
     def forward(self, x):
         return self.scale * self.relu(x) ** 2 + self.bias
-
-
-class Attention(nn.Module):
-    """
-    Vanilla self-attention from Transformer: https://arxiv.org/abs/1706.03762.
-    Modified from timm.
-    """
-
-    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
-                 attn_drop=0.05, proj_drop=0.05, proj_bias=False, **kwargs):
-        super().__init__()
-
-        self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
-
-        self.num_heads = num_heads if num_heads else dim // head_dim
-        if self.num_heads == 0:
-            self.num_heads = 1
-
-        self.attention_dim = self.num_heads * self.head_dim
-
-        self.qkv = nn.Linear(dim, self.attention_dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(self.attention_dim, dim, bias=proj_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, H, W, C = x.shape
-        N = H * W
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.attention_dim)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class RandomMixing(nn.Module):
-    def __init__(self, num_tokens=196, **kwargs):
-        super().__init__()
-        self.random_matrix = nn.parameter.Parameter(
-            data=torch.softmax(torch.rand(num_tokens, num_tokens), dim=-1),
-            requires_grad=False)
-
-    def forward(self, x):
-        B, H, W, C = x.shape
-        x = x.reshape(B, H * W, C)
-        x = torch.einsum('mn, bnc -> bmc', self.random_matrix, x)
-        x = x.reshape(B, H, W, C)
-        return x
-
 
 class LayerNormGeneral(nn.Module):
     r""" General LayerNorm for different situations.
@@ -245,28 +188,8 @@ class SepConv(nn.Module):
         return x
 
 
-class Pooling(nn.Module):
-    """
-    Implementation of pooling for PoolFormer: https://arxiv.org/abs/2111.11418
-    Modfiled for [B, H, W, C] input
-    """
-
-    def __init__(self, pool_size=3, **kwargs):
-        super().__init__()
-        self.pool = nn.AvgPool2d(
-            pool_size, stride=1, padding=pool_size // 2, count_include_pad=False)
-
-    def forward(self, x):
-        y = x.permute(0, 3, 1, 2)
-        y = self.pool(y)
-        y = y.permute(0, 2, 3, 1)
-        return y - x
-
 
 class Mlp(nn.Module):
-    """ MLP as used in MetaFormer models, eg Transformer, MLP-Mixer, PoolFormer, MetaFormer baslines and related networks.
-    Mostly copied from timm.
-    """
 
     def __init__(self, dim, mlp_ratio=4, out_features=None, act_layer=StarReLU, drop=0.05, bias=False, **kwargs):
         super().__init__()
@@ -313,9 +236,9 @@ class MlpHead(nn.Module):
         return x
 
 
-class MetaFormerBlock(nn.Module):
+class FormerBlock(nn.Module):
     """
-    Implementation of one MetaFormer block.
+    Implementation of one convface block.
     """
 
     def __init__(self, dim,
@@ -358,70 +281,63 @@ class MetaFormerBlock(nn.Module):
         return x
 
 class ACMBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, drop_prob=0.15):
         super(ACMBlock, self).__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels
 
-        # 用于计算 keys 的卷积层
-        self.k_conv = nn.Conv2d(self.in_channels, self.out_channels, (1, 1), groups=self.in_channels) #
+        # Keys and Queries convolution layers
+        self.k_conv = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, groups=self.in_channels)
+        self.q_conv = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, groups=self.in_channels)
 
-        # 用于计算 queries 的卷积层
-        self.q_conv = nn.Conv2d(self.in_channels, self.out_channels, (1, 1), groups=self.in_channels)
-
-        # 用于计算通道权重的全局池化层
-        self.global_pooling = nn.Sequential(
-            nn.Conv2d(self.in_channels, self.out_channels // 2, (1, 1)),
+        # Dynamic channel attention
+        self.channel_attention = nn.Sequential(
+            nn.Conv2d(self.in_channels * 2, self.out_channels // 2, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(self.out_channels // 2, self.out_channels, (1, 1)),
+            nn.Conv2d(self.out_channels // 2, self.out_channels, kernel_size=1),
             nn.Sigmoid()
         )
 
-        self.drop = DropPath(0.05)  # 定义 DropPath
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # 自适应平均池化层
-        self.normalize = nn.Softmax(dim=3)  # Softmax 归一化
-        self.alpha = nn.Parameter(torch.ones(1))
+        self.drop = DropPath(drop_prob)  # DropPath for regularization
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # Adaptive average pooling
+        self.normalize = nn.Softmax(dim=-1)  # Softmax normalization along the last dimension
 
     def _get_normalized_features(self, x):
-        """获取特征的通道维度上的均值向量"""
+        """Compute the mean vector along the channel dimension."""
         return self.avgpool(x)
 
     def forward(self, x1, x2):
-        # 获取输入特征的通道维度上的均值向量
+  #      print('x1',x1.shape,'x2',x2.shape)
+        # Compute mean vectors for normalization
         mean_x1 = self._get_normalized_features(x1)
         mean_x2 = self._get_normalized_features(x2)
         x1_mu = x1 - mean_x1
         x2_mu = x2 - mean_x2
 
-        # 计算 keys 和 queries
+        # Compute keys and queries
         K = self.k_conv(x1_mu)
         Q = self.q_conv(x2_mu)
 
         b, c, h, w = K.shape
 
-        # 将 keys 和 queries 重塑并进行归一化
-        K = K.view(b, c, 1, h * w)
-        K = self.normalize(K)
-        K = K.view(b, c, h, w)
+        # Reshape and normalize keys and queries
+        K = K.view(b, c, -1)  # [B, C, H*W]
+        Q = Q.view(b, c, -1)  # [B, C, H*W]
 
-        Q = Q.view(b, c, 1, h * w)
-        Q = self.normalize(Q)
-        Q = Q.view(b, c, h, w)
+        K = self.normalize(K).view(b, c, h, w)
+        Q = self.normalize(Q).view(b, c, h, w)
 
-        # 计算 keys 和 queries 的匹配分数
-        K = torch.einsum('nchw,nchw->nc', [K, x1_mu]).view(b, c, 1, 1)
-        Q = torch.einsum('nchw,nchw->nc', [Q, x2_mu]).view(b, c, 1, 1)
+        # Compute attention scores
+        K_score = torch.einsum('nchw,nchw->nc', [K, x1_mu]).view(b, c, 1, 1)
+        Q_score = torch.einsum('nchw,nchw->nc', [Q, x2_mu]).view(b, c, 1, 1)
 
-        # 计算通道权重
-        channel_weights1 = self.global_pooling(mean_x1)
-        channel_weights2 = self.global_pooling(mean_x2)
+        # Concatenate mean vectors for dynamic channel attention
+        mean_concat = torch.cat([mean_x1, mean_x2], dim=1)
+        channel_weights = self.channel_attention(mean_concat)
 
-        # 计算输出特征
-        out1 = x1 + self.alpha *Q
-        out2 = x2 + self.alpha *K
-
-        out1 = channel_weights1 * out1
-        out2 = channel_weights2 * out2
+        # Compute fused outputs
+        out1 = channel_weights * (x1 + Q_score)
+        out2 = channel_weights * (x2 + K_score)
 
         return self.drop(out1), self.drop(out2)
 
@@ -433,11 +349,11 @@ DOWNSAMPLE_LAYERS_FOUR_STAGES format: [Downsampling, Downsampling, Downsampling,
 use `partial` to specify some arguments
 """
 DOWNSAMPLE_LAYERS_FOUR_STAGES = [partial(Downsampling,
-                                         kernel_size=7, stride=4, padding=2,
+                                         kernel_size=7, stride=5, padding=2,
                                          post_norm=partial(LayerNormGeneral, bias=False, eps=1e-6)
                                          )] + \
                                 [partial(Downsampling,
-                                         kernel_size=3, stride=2, padding=1,
+                                         kernel_size=3, stride=3, padding=1,
                                          pre_norm=partial(LayerNormGeneral, bias=False, eps=1e-6), pre_permute=True
                                          )] * 3
 class LayerNorm(nn.Module):
@@ -498,30 +414,7 @@ class Local_block(nn.Module):
         return x
 
 
-class MetaFormer(nn.Module):
-    r""" MetaFormer
-        A PyTorch impl of : `MetaFormer Baselines for Vision`  -
-          https://arxiv.org/abs/2210.13452
-
-    Args:
-        in_chans (int): Number of input image channels. Default: 3.
-        num_classes (int): Number of classes for classification head. Default: 1000.
-        depths (list or tuple): Number of blocks at each stage. Default: [2, 2, 6, 2].
-        dims (int): Feature dimension at each stage. Default: [64, 128, 320, 512].
-        downsample_layers: (list or tuple): Downsampling layers before each stage.
-        token_mixers (list, tuple or token_fcn): Token mixer for each stage. Default: nn.Identity.
-        mlps (list, tuple or mlp_fcn): Mlp for each stage. Default: Mlp.
-        norm_layers (list, tuple or norm_fcn): Norm layers for each stage. Default: partial(LayerNormGeneral, eps=1e-6, bias=False).
-        drop_path_rate (float): Stochastic depth rate. Default: 0.
-        head_dropout (float): dropout for MLP classifier. Default: 0.
-        layer_scale_init_values (list, tuple, float or None): Init value for Layer Scale. Default: None.
-            None means not use the layer scale. Form: https://arxiv.org/abs/2103.17239.
-        res_scale_init_values (list, tuple, float or None): Init value for Layer Scale. Default: [None, None, 1.0, 1.0].
-            None means not use the layer scale. From: https://arxiv.org/abs/2110.09456.
-        output_norm: norm before classifier head. Default: partial(nn.LayerNorm, eps=1e-6).
-        head_fn: classification head. Default: nn.Linear.
-    """
-
+class faceFormer(nn.Module):
     def __init__(self, in_chans=3, num_classes=1000,
                  depths=[2, 2, 6, 2],
                  dims=[64, 128, 320, 512],
@@ -576,7 +469,7 @@ class MetaFormer(nn.Module):
         cur = 0
         for i in range(num_stage):
             stage = nn.Sequential(
-                *[MetaFormerBlock(dim=dims[i],
+                *[FormerBlock(dim=dims[i],
                                   token_mixer=token_mixers[i],
                                   mlp=mlps[i],
                                   norm_layer=norm_layers[i],
@@ -655,33 +548,23 @@ class MetaFormer(nn.Module):
         x = self.head(x)
         return x
 
-@register_model
-def convformer_s18(pretrained=False,num_classes=1, **kwargs):
-    model = MetaFormer(
+def convface(pretrained=False,num_classes=1, **kwargs):
+    model = faceFormer(
         depths=[3, 4, 7, 3],
         dims=[64, 128, 320, 512],
         token_mixers=SepConv,# 把Sep换成LOCAAL 速度不仅慢，效果也蛮差的
         head_fn=MlpHead,
         num_classes=num_classes,
         **kwargs)
-    model.default_cfg = default_cfgs['convformer_s18']
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url=model.default_cfg['url'], map_location="cpu", check_hash=True)
-        model.load_state_dict(state_dict)
+
     return model
 
-def caformer_s18(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[3, 3, 9, 3],
-        dims=[64, 128, 320, 512],
-        token_mixers=[SepConv, SepConv, Attention, Attention],
-        head_fn=MlpHead,
-        num_classes=1,
-        **kwargs)
-    model.default_cfg = default_cfgs['caformer_s18']
-    if pretrained:
-        state_dict = torch.hub.load_state_dict_from_url(
-            url= model.default_cfg['url'], map_location="cpu", check_hash=True)
-        model.load_state_dict(state_dict)
-    return model
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # a simple test
+    model = convface(num_classes=2)
+    model = model.to(device)
+    inp = torch.rand(10, 3, 224, 224).to(device)
+    out = model(inp).to(device)
+    # Print the number of trainable parameters
+    print(out.shape)
